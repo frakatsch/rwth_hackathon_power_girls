@@ -7,8 +7,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LinearRegression, Ridge, ElasticNet
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
+from sklearn.metrics import r2_score, mean_squared_error
 
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Any
 
 from utils.combined_preprocessing import preprocess_temporal_data
 from utils.combined_preprocessing import transform_categorical_features
@@ -70,25 +71,21 @@ def tune_and_fit_pipeline(
         pipeline.fit(X_train, y_train)
         return pipeline, params
     else:
-        logger.info("Running Hyperparameter GridSearch (Inner CV)...")
-    inner_cv = TimeSeriesSplit(n_splits=n_inner_splits)
+        inner_cv = TimeSeriesSplit(n_splits=n_inner_splits)
 
-    grid_search = GridSearchCV(
-        estimator=pipeline,
-        param_grid=param_grid,
-        cv=inner_cv,
-        scoring="neg_root_mean_squared_error",
-        n_jobs=-1,
-        verbose=0
-    )
+        grid_search = GridSearchCV(
+            estimator=pipeline,
+            param_grid=param_grid,
+            cv=inner_cv,
+            scoring="neg_root_mean_squared_error",
+            n_jobs=-1,
+            verbose=0
+        )
 
-    # GridSearchCV automatically handles the inner loop splits and refits on the whole X_train
-    grid_search.fit(X_train, y_train)
+        # GridSearchCV automatically handles the inner loop splits and refits on the whole X_train
+        grid_search.fit(X_train, y_train)
 
-    logger.info(f"Best Hyperparameters [{model_type}]: {grid_search.best_params_}")
-    logger.info(f"Best Inner CV RMSE: {-grid_search.best_score_:.4f}")
-
-    return grid_search.best_estimator_, grid_search.best_params_
+        return grid_search.best_estimator_, grid_search.best_params_
 
 
 def evaluate_temporal_breakdown(
@@ -96,10 +93,15 @@ def evaluate_temporal_breakdown(
     y_pred: np.ndarray,
     dates: pd.Series
 ) -> None:
-    """
-    Calculates and logs RMSE across distinct temporal granularities.
-    """
-    eval_df = pd.DataFrame({"y_true": y_true.values, "y_pred": y_pred, "datetime": dates.values})
+    """Calculates and logs RMSE across distinct temporal granularities."""
+    # Ensure datetimelike dtype to avoid .dt accessor errors
+    datetime_series = pd.to_datetime(dates.values if isinstance(dates, (pd.Series, pd.Index)) else dates)
+
+    eval_df = pd.DataFrame({
+        "y_true": np.asarray(y_true),
+        "y_pred": np.asarray(y_pred),
+        "datetime": datetime_series
+    })
 
     periods = {
         "Year": eval_df["datetime"].dt.year,
@@ -109,42 +111,42 @@ def evaluate_temporal_breakdown(
     }
 
     for period_name, grouping_col in periods.items():
-        logger.info(f"--- Performance by {period_name} ---")
+        # logger.info(f"--- Performance by {period_name} ---")
         grouped = eval_df.groupby(grouping_col)
         for name, group in grouped:
             if len(group) > 0:
-                rmse = np.sqrt(np.mean((group["y_true"] - group["y_pred"]) ** 2))
-                logger.info(f"  {period_name} [{name}] (n={len(group)}): RMSE = {rmse:.4f}")
+                rmse = np.sqrt(mean_squared_error(group["y_true"], group["y_pred"]))
+                # logger.info(f"  {period_name} [{name}] (n={len(group)}): RMSE = {rmse:.4f}")
 
 
 def regression_performance(
-    pipeline: Pipeline,
+    pipeline: Any,
     X_train: pd.DataFrame,
     y_train: pd.Series,
     X_test: pd.DataFrame,
     y_test: pd.Series,
     dates_test: pd.Series = None
 ) -> Dict[str, float]:
-    """
-    Evaluates global performance and prints temporal breakdowns.
-    """
+    """Evaluates global performance and prints temporal breakdowns efficiently."""
+    # Single prediction pass per dataset
     y_train_pred = pipeline.predict(X_train)
     y_test_pred = pipeline.predict(X_test)
 
-    r2_train = np.round(pipeline.score(X_train, y_train), 4)
-    rmse_train = np.round(np.sqrt(np.mean((y_train - y_train_pred) ** 2)), 4)
+    # Compute metrics from existing predictions
+    r2_train = r2_score(y_train, y_train_pred)
+    rmse_train = np.sqrt(mean_squared_error(y_train, y_train_pred))
 
-    r2_test = np.round(pipeline.score(X_test, y_test), 4)
-    rmse_test = np.round(np.sqrt(np.mean((y_test - y_test_pred) ** 2)), 4)
+    r2_test = r2_score(y_test, y_test_pred)
+    rmse_test = np.sqrt(mean_squared_error(y_test, y_test_pred))
 
     logger.info("Model Global Performance:")
-    logger.info(f"  Training Set: R2 = {r2_train}, RMSE = {rmse_train}")
-    logger.info(f"  Testing Set:  R2 = {r2_test}, RMSE = {rmse_test}")
+    logger.info(f"  Training Set: R2 = {r2_train:.4f}, RMSE = {rmse_train:.4f}")
+    logger.info(f"  Testing Set:  R2 = {r2_test:.4f}, RMSE = {rmse_test:.4f}")
 
     if dates_test is not None:
         evaluate_temporal_breakdown(y_test, y_test_pred, dates_test)
 
-    return {"r2_test": r2_test, "rmse_test": rmse_test}
+    return {"r2_test": float(r2_test), "rmse_test": float(rmse_test)}
 
 
 def model_training(inputs_df: pd.DataFrame,
@@ -199,7 +201,7 @@ def model_training(inputs_df: pd.DataFrame,
             y_outer_train, 
             model_type=model_type, 
             n_inner_splits=n_inner_splits, 
-            random_state=random_state
+            random_state=random_state,
         )
 
         logger.info(f"Outer Fold {outer_fold_idx + 1} Final Holdout Evaluation:")
@@ -214,7 +216,7 @@ def model_training(inputs_df: pd.DataFrame,
         outer_scores.append(metrics["rmse_test"])
 
     logger.info("\n================ Nested CV Summary ================")
-    logger.info(f"Average Estimated Unseen RMSE: {np.mean(outer_scores):.4f} +/- {np.std(outer_scores):.4f}")
+    logger.info(f"Average estimated unseen RMSE: {np.mean(outer_scores):.4f} +/- {np.std(outer_scores):.4f}")
 
     # 2. FINAL PRODUCTION MODEL
     # Fit on 100% of the available data to create the model you will actually deploy
@@ -238,7 +240,9 @@ def model_training(inputs_df: pd.DataFrame,
     mean_rmse = np.mean(outer_scores)
     std_rmse = np.std(outer_scores)
 
-    with open(f"results/production_metrics_{model_type}.pkl", "wb") as f:
+    logger.info(f"Production model metrics: mean_rmse={mean_rmse:.4f}, std_rmse={std_rmse:.4f}")
+
+    with open(f"results/estimated_production_metrics_{model_type}.pkl", "wb") as f:
         pickle.dump({"mean_rmse": mean_rmse, "std_rmse": std_rmse}, f)
 
     return production_pipeline
