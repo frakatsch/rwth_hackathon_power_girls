@@ -28,3 +28,6 @@ uv.lock
 data_processed/
 
 data/weather_data_15min/weather_data_15min.csv
+
+data/household_data_15min/
+data/preprocessed/
