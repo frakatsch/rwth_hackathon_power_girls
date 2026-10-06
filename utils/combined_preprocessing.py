@@ -8,22 +8,21 @@ def preprocess_temporal_data(
     target_column: str,
     time_column: str,
     id_column: str,
-    
+    horizon: int = 24  # Forecasting horizon (e.g., 24 hours ahead)
 ) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
     """
-    Sorts data chronologically, extracts datetime features, and separates features/target.
+    Sorts data chronologically, creates historical target features up to time t,
+    shifts the target variable to predict horizon steps ahead, and cleans NaNs.
     """
     df = df.copy()
     if time_column not in df.columns:
         raise ValueError(f"Time column '{time_column}' not found in DataFrame.")
     else:
         df[time_column] = pd.to_datetime(df[time_column])
+        
     df = df.sort_values(by=time_column).reset_index(drop=True)
 
-    # Date metadata retained for temporal breakdown calculations
-    dates = df[time_column]
-
-    # Feature Engineering from timestamp
+    # 1. Feature Engineering from timestamp
     df["year"] = df[time_column].dt.year
     df["month"] = df[time_column].dt.month
     df["week"] = df[time_column].dt.isocalendar().week.astype(int)
@@ -31,9 +30,29 @@ def preprocess_temporal_data(
     df["dayofweek"] = df[time_column].dt.dayofweek
     df["hour"] = df[time_column].dt.hour
 
-    # Drop non-predictive metadata from features matrix
-    X = df.drop(columns=[target_column, time_column, id_column], errors="ignore")
-    y = df[target_column]
+    # 2. Add Target Lags (Present t and past observations)
+    df[f"{target_column}_lag_0"] = df[target_column]  # Present target value y_t
+    
+    # Past historical lags (y_{t-1}, y_{t-2}, y_{t-24}, y_{t-168})
+    for lag in [1, 2, 3, 24, 48, 168]:
+        df[f"{target_column}_lag_{lag}"] = df[target_column].shift(lag)
+
+    # Rolling target statistics up to time t
+    df[f"{target_column}_roll_mean_24"] = df[target_column].rolling(window=24).mean()
+    df[f"{target_column}_roll_std_24"] = df[target_column].rolling(window=24).std()
+
+    # 3. Create Day-Ahead Target (Predict y_{t + horizon})
+    df["target_future"] = df[target_column].shift(-horizon)
+
+    # 4. Clean missing values resulting from lag creation and target shifting
+    df = df.dropna().reset_index(drop=True)
+
+    # Extract metadata, shifted target y, and feature matrix X
+    dates = df[time_column]
+    y = df["target_future"]
+    
+    # Drop original non-future target, future target, and identifier metadata
+    X = df.drop(columns=[target_column, "target_future", time_column, id_column], errors="ignore")
 
     return X, y, dates
 
@@ -42,6 +61,7 @@ def transform_categorical_features(X: pd.DataFrame) -> pd.DataFrame:
     """
     One-hot encodes categorical features in the DataFrame X.
     """
+    # TODO: OHE
     categorical_cols = X.select_dtypes(include=["object", "category"]).columns
     X = pd.get_dummies(X, columns=categorical_cols, drop_first=True)
     return X

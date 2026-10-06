@@ -3,11 +3,12 @@ import numpy as np
 import logging
 import pickle
 
-import xgboost as xgb
-
 from sklearn.pipeline import Pipeline
-from sklearn.linear_model import LinearRegression, Ridge, ElasticNet
 from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.linear_model import LinearRegression, Ridge, ElasticNet
+import xgboost as xgb
+from prophet import Prophet
+from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 from sklearn.metrics import r2_score, mean_squared_error
 
@@ -21,12 +22,138 @@ from utils.combined_preprocessing import transform_skewed_features
 logger = logging.getLogger("Power Girls")
 logging.basicConfig(level=logging.INFO)
 
+logging.getLogger("prophet").setLevel(logging.ERROR)
+logging.getLogger("cmdstanpy").setLevel(logging.ERROR)
+
+
+class ProphetRegressor(BaseEstimator, RegressorMixin):
+    """
+    Scikit-learn wrapper for Meta Prophet to enable Pipeline and GridSearchCV support.
+    """
+    def __init__(
+        self,
+        date_col: str = None,
+        growth: str = "linear",
+        changepoint_prior_scale: float = 0.05,
+        seasonality_prior_scale: float = 10.0,
+        holidays_prior_scale: float = 10.0,
+        seasonality_mode: str = "additive",
+        yearly_seasonality: Any = "auto",
+        weekly_seasonality: Any = "auto",
+        daily_seasonality: Any = "auto"
+    ):
+        self.date_col = date_col
+        self.growth = growth
+        self.changepoint_prior_scale = changepoint_prior_scale
+        self.seasonality_prior_scale = seasonality_prior_scale
+        self.holidays_prior_scale = holidays_prior_scale
+        self.seasonality_mode = seasonality_mode
+        self.yearly_seasonality = yearly_seasonality
+        self.weekly_seasonality = weekly_seasonality
+        self.daily_seasonality = daily_seasonality
+
+    def _prepare_df(self, X: pd.DataFrame, y: pd.Series = None) -> Tuple[pd.DataFrame, list]:
+        X_df = pd.DataFrame(X).copy()
+
+        # Extract date column or use datetime index
+        if self.date_col and self.date_col in X_df.columns:
+            ds = X_df.pop(self.date_col)
+        elif isinstance(X_df.index, pd.DatetimeIndex):
+            ds = X_df.index
+        else:
+            datetime_cols = X_df.select_dtypes(include=["datetime", "datetime64"]).columns
+            if len(datetime_cols) > 0:
+                ds = X_df.pop(datetime_cols[0])
+            else:
+                raise ValueError("Prophet requires a DatetimeIndex or a datetime column in X.")
+
+        df = pd.DataFrame({"ds": pd.to_datetime(ds)}, index=X_df.index)
+
+        # Remaining columns are treated as exogenous regressors
+        exog_cols = list(X_df.columns)
+        for col in exog_cols:
+            df[col] = X_df[col]
+
+        if y is not None:
+            df["y"] = np.asarray(y)
+
+        return df, exog_cols
+
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        df, exog_cols = self._prepare_df(X, y)
+
+        self.model_ = Prophet(
+            growth=self.growth,
+            changepoint_prior_scale=self.changepoint_prior_scale,
+            seasonality_prior_scale=self.seasonality_prior_scale,
+            holidays_prior_scale=self.holidays_prior_scale,
+            seasonality_mode=self.seasonality_mode,
+            yearly_seasonality=self.yearly_seasonality,
+            weekly_seasonality=self.weekly_seasonality,
+            daily_seasonality=self.daily_seasonality
+        )
+
+        for col in exog_cols:
+            self.model_.add_regressor(col)
+
+        self.model_.fit(df)
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        df, _ = self._prepare_df(X)
+        forecast = self.model_.predict(df)
+        return forecast["yhat"].values
+
+
+
+def get_local_filter(target_dt: pd.Timestamp, dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """Filters data for similar hours and days relative to a target prediction time."""
+    
+    t_year = target_dt.year
+    t_date = target_dt.date()
+    t_doy = target_dt.dayofyear
+    t_hour = target_dt.hour
+    
+    # 1. Hour Conditions
+    # +/- 2 hours (using modulo 24 to handle midnight wrap-around)
+    hour_min, hour_max = (t_hour - 2) % 24, (t_hour + 2) % 24
+    if hour_min < hour_max:
+        similar_hours = dates.dt.hour.between(hour_min, hour_max)
+    else: 
+        similar_hours = (dates.dt.hour >= hour_min) | (dates.dt.hour <= hour_max)
+        
+    # Exactly -2h for the current day
+    current_day_hour = dates.dt.hour == (t_hour - 2) % 24
+
+    # 2. Day Conditions
+    # Past years: +/- 10 days (calculating day-of-year distance)
+    doy_diff = (dates.dt.dayofyear - t_doy).abs()
+    doy_diff = np.minimum(doy_diff, 365 - doy_diff) # Handle Dec/Jan wrap-around
+    past_years_mask = (dates.dt.year < t_year) & (doy_diff <= 10) & similar_hours
+    
+    # Current year: strictly past 10 days
+    current_year_mask = (
+        (dates.dt.year == t_year) & 
+        (dates.dt.date < t_date) & 
+        (dates >= target_dt - pd.Timedelta(days=10)) & 
+        similar_hours
+    )
+    
+    # Current day: only the -2h window
+    current_day_mask = (dates.dt.date == t_date) & current_day_hour
+
+    # 3. Combine and Apply
+    final_mask = past_years_mask | current_year_mask | current_day_mask
+    
+    return final_mask
+
 
 def tune_and_fit_pipeline(
     X_train: pd.DataFrame, 
     y_train: pd.Series, 
     model_type: str = "linearregression",
     n_inner_splits: int = 3,
+    time_column: str = None,
     random_state: int = 42,
     params: Dict = None
 ) -> Tuple[Pipeline, Dict]:
@@ -34,6 +161,7 @@ def tune_and_fit_pipeline(
     Tunes pipeline hyperparameters using temporal inner cross-validation.
     Returns the best estimator retrained on the entire X_train set.
     """
+
     # 1. Define Pipeline and Hyperparameter Grid
     if model_type == "linearregression":
         pipeline = Pipeline([
@@ -77,6 +205,21 @@ def tune_and_fit_pipeline(
             "model__subsample": [0.8, 1.0],
             "model__colsample_bytree": [0.8, 1.0]
         }
+    elif model_type == "prophet":
+        X_with_date = X_train.copy()
+        if time_column and time_column.name not in X_with_date.columns:
+            X_with_date[time_column.name] = time_column
+
+        pipeline = Pipeline([
+            ("scaler", "passthrough"), # Prophet handles feature scaling internally
+            ("model", ProphetRegressor(date_col=time_column.name))
+        ])
+        param_grid = {
+            "scaler": ["passthrough"],
+            "model__changepoint_prior_scale": [0.01, 0.05, 0.1, 0.5],
+            "model__seasonality_prior_scale": [0.1, 1.0, 10.0],
+            "model__seasonality_mode": ["additive", "multiplicative"]
+        }
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 
@@ -93,7 +236,7 @@ def tune_and_fit_pipeline(
             param_grid=param_grid,
             cv=inner_cv,
             scoring="neg_root_mean_squared_error",
-            n_jobs=-1,
+            n_jobs=1 if model_type == "prophet" else -1,
             verbose=0
         )
 
@@ -195,34 +338,45 @@ def model_training(inputs_df: pd.DataFrame,
     X = transform_categorical_features(X)  #TODO: OHE
     X = transform_skewed_features(X, skew_threshold=0.75)  # TODO: transform back?
 
-    # Outer loop for cross-validation
+    # Nested CV: outer loop
     tscv = TimeSeriesSplit(
-        n_splits=n_outer_splits,
-        gap=24*4,               # e.g., one day gap to prevent leakage from lag features
-        test_size=24 * 4 * 30,  # 30 days of hourly data for testing (assuming 15 minute frequency)
-        max_train_size=None     # None = Expanding window
-    )  # TODO: use past to predict future
+        n_splits=n_outer_splits)
 
     outer_scores = []
 
     for outer_fold_idx, (outer_train_idx, outer_test_idx) in enumerate(tscv.split(X)):
         logger.info(f"\n================ Outer Fold {outer_fold_idx + 1}/{n_outer_splits} ================")
+        
         X_outer_train, X_outer_test = X.iloc[outer_train_idx], X.iloc[outer_test_idx]
         y_outer_train, y_outer_test = y.iloc[outer_train_idx], y.iloc[outer_test_idx]
-        dates_outer_test = dates.iloc[outer_test_idx]
+        dates_outer_train, dates_outer_test = dates.iloc[outer_train_idx], dates.iloc[outer_test_idx]
 
-        # Inner loop is handled automatically by GridSearchCV inside this function
-        final_outer_pipeline, best_params = tune_and_fit_pipeline(
-            X_outer_train, 
-            y_outer_train, 
+        # Local filter
+        for idx, row in X_outer_train.iterrows():
+            target_dt = dates.iloc[idx]
+
+            local_idx = get_local_filter(target_dt, dates_outer_train)
+            X_outer_train_local = X_outer_train.loc[local_idx.index]
+            y_outer_train_local = y_outer_train.loc[local_idx.index]
+
+            if len(X_outer_train_local) < 10:
+                continue
+            else:
+                logger.info(f"Outer Fold {outer_fold_idx + 1}: Local training data size for target_dt {target_dt} is {len(X_outer_train_local)}")
+
+        # Nested CV: inner loop is handled automatically by GridSearchCV
+        outer_pipeline, best_params = tune_and_fit_pipeline(
+            X_outer_train_local, 
+            y_outer_train_local,
             model_type=model_type, 
             n_inner_splits=n_inner_splits, 
+            time_column=dates,
             random_state=random_state,
         )
 
         logger.info(f"Outer Fold {outer_fold_idx + 1} Final Holdout Evaluation:")
         metrics = regression_performance(
-            final_outer_pipeline, 
+            outer_pipeline, 
             X_outer_train, 
             y_outer_train, 
             X_outer_test, 
@@ -241,6 +395,7 @@ def model_training(inputs_df: pd.DataFrame,
         X, y, 
         model_type=model_type, 
         n_inner_splits=n_inner_splits, 
+        time_column=dates,
         random_state=random_state
     )
     
