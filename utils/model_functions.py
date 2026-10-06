@@ -14,9 +14,6 @@ from sklearn.metrics import r2_score, mean_squared_error
 from typing import Dict, Tuple, Any
 
 from utils.combined_preprocessing import preprocess_temporal_data
-from utils.combined_preprocessing import transform_categorical_features
-from utils.combined_preprocessing import transform_skewed_features
-
 
 logger = logging.getLogger("Power Girls")
 logging.basicConfig(level=logging.INFO)
@@ -34,6 +31,7 @@ def tune_and_fit_pipeline(
     Tunes pipeline hyperparameters using temporal inner cross-validation.
     Returns the best estimator retrained on the entire X_train set.
     """
+
     # 1. Define Pipeline and Hyperparameter Grid
     if model_type == "linearregression":
         pipeline = Pipeline([
@@ -77,6 +75,9 @@ def tune_and_fit_pipeline(
             "model__subsample": [0.8, 1.0],
             "model__colsample_bytree": [0.8, 1.0]
         }
+    elif model_type == "prophet":
+        # Prophet requires a different approach and is not compatible with sklearn pipelines
+        raise NotImplementedError("Prophet model type is not yet implemented in this pipeline.")
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 
@@ -93,8 +94,8 @@ def tune_and_fit_pipeline(
             param_grid=param_grid,
             cv=inner_cv,
             scoring="neg_root_mean_squared_error",
-            n_jobs=-1,
-            verbose=0
+            n_jobs=-1 if model_type != "prophet" else 1,
+            verbose=0,
         )
 
         # GridSearchCV automatically handles the inner loop splits and refits on the whole X_train
@@ -167,7 +168,6 @@ def regression_performance(
 def model_training(inputs_df: pd.DataFrame,
                    time_column: str,
                    target_column: str,
-                   id_column: str = "id",
                    model_type: str = "linearregression",
                    n_outer_splits: int = 3,
                    n_inner_splits: int = 2,
@@ -180,7 +180,6 @@ def model_training(inputs_df: pd.DataFrame,
     inputs_df (pd.DataFrame): The input DataFrame containing features and target variable.
     time_column (str): The name of the time column in the DataFrame.
     target_column (str): The name of the target column in the DataFrame.
-    id_column (str): The name of the ID column in the DataFrame.
     model_type (str): The type of model to train. Currently supports "linearregression".
     n_outer_splits (int): The number of outer cross-validation splits.
     n_inner_splits (int): The number of inner cross-validation splits.
@@ -191,19 +190,19 @@ def model_training(inputs_df: pd.DataFrame,
     """
 
     # Additional preprocessing
-    X, y, dates = preprocess_temporal_data(inputs_df, target_column, time_column, id_column)
-    X = transform_categorical_features(X)  #TODO: OHE
-    X = transform_skewed_features(X, skew_threshold=0.75)  # TODO: transform back?
+    X, y, dates = preprocess_temporal_data(inputs_df, target_column, time_column, model_type=model_type)
 
     # Outer loop for cross-validation
     tscv = TimeSeriesSplit(
         n_splits=n_outer_splits,
-        gap=24*4,               # e.g., one day gap to prevent leakage from lag features
-        test_size=24 * 4 * 30,  # 30 days of hourly data for testing (assuming 15 minute frequency)
-        max_train_size=None     # None = Expanding window
-    )  # TODO: use past to predict future
+    )
 
     outer_scores = []
+    oof_predictions = pd.DataFrame({
+        "time": dates,
+        "y_true": np.nan,
+        "y_pred": np.nan
+    }, index=X.index)
 
     for outer_fold_idx, (outer_train_idx, outer_test_idx) in enumerate(tscv.split(X)):
         logger.info(f"\n================ Outer Fold {outer_fold_idx + 1}/{n_outer_splits} ================")
@@ -212,7 +211,7 @@ def model_training(inputs_df: pd.DataFrame,
         dates_outer_test = dates.iloc[outer_test_idx]
 
         # Inner loop is handled automatically by GridSearchCV inside this function
-        final_outer_pipeline, best_params = tune_and_fit_pipeline(
+        outer_pipeline, best_params = tune_and_fit_pipeline(
             X_outer_train, 
             y_outer_train, 
             model_type=model_type, 
@@ -222,7 +221,7 @@ def model_training(inputs_df: pd.DataFrame,
 
         logger.info(f"Outer Fold {outer_fold_idx + 1} Final Holdout Evaluation:")
         metrics = regression_performance(
-            final_outer_pipeline, 
+            outer_pipeline, 
             X_outer_train, 
             y_outer_train, 
             X_outer_test, 
@@ -230,6 +229,9 @@ def model_training(inputs_df: pd.DataFrame,
             dates_test=dates_outer_test
         )
         outer_scores.append(metrics["rmse_test"])
+
+        oof_predictions.loc[outer_test_idx, "y_true"] = y_outer_test.values
+        oof_predictions.loc[outer_test_idx, "y_pred"] = outer_pipeline.predict(X_outer_test)
 
     logger.info("\n================ Nested CV Summary ================")
     logger.info(f"Average estimated unseen RMSE: {np.mean(outer_scores):.4f} +/- {np.std(outer_scores):.4f}")
@@ -260,5 +262,9 @@ def model_training(inputs_df: pd.DataFrame,
 
     with open(f"results/estimated_production_metrics_{model_type}.pkl", "wb") as f:
         pickle.dump({"mean_rmse": mean_rmse, "std_rmse": std_rmse}, f)
+
+    # save the oof predictions of the production model
+    oof_predictions.to_pickle(f"results/estimated_production_predictions_{model_type}.pkl")
+
 
     return production_pipeline
