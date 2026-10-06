@@ -3,6 +3,8 @@ import numpy as np
 import logging
 import pickle
 
+import xgboost as xgb
+
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LinearRegression, Ridge, ElasticNet
 from sklearn.preprocessing import StandardScaler, RobustScaler
@@ -61,6 +63,19 @@ def tune_and_fit_pipeline(
             "scaler": [StandardScaler(), RobustScaler()],
             "model__alpha": [0.01, 0.1, 1.0, 10.0],
             "model__l1_ratio": [0.1, 0.3, 0.5, 0.7, 0.9]
+        }
+    elif model_type == "xgboost":
+        pipeline = Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", xgb.XGBRegressor(random_state=random_state, objective="reg:squarederror", n_jobs=1))
+        ])
+        param_grid = {
+            "scaler": ["passthrough", StandardScaler()], # Trees don't require scaling
+            "model__n_estimators": [100, 200, 500],
+            "model__learning_rate": [0.01, 0.05, 0.1],
+            "model__max_depth": [3, 5, 7],
+            "model__subsample": [0.8, 1.0],
+            "model__colsample_bytree": [0.8, 1.0]
         }
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
@@ -175,9 +190,10 @@ def model_training(inputs_df: pd.DataFrame,
     Pipeline: The trained model pipeline.
     """
 
+    # Additional preprocessing
     X, y, dates = preprocess_temporal_data(inputs_df, target_column, time_column, id_column)
-    X = transform_categorical_features(X)
-    X = transform_skewed_features(X, skew_threshold=0.75)
+    X = transform_categorical_features(X)  #TODO: OHE
+    X = transform_skewed_features(X, skew_threshold=0.75)  # TODO: transform back?
 
     # Outer loop for cross-validation
     tscv = TimeSeriesSplit(
@@ -185,7 +201,7 @@ def model_training(inputs_df: pd.DataFrame,
         gap=24*4,               # e.g., one day gap to prevent leakage from lag features
         test_size=24 * 4 * 30,  # 30 days of hourly data for testing (assuming 15 minute frequency)
         max_train_size=None     # None = Expanding window
-    )
+    )  # TODO: use past to predict future
 
     outer_scores = []
 
